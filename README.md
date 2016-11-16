@@ -1,2 +1,2 @@
 # righthand
-Verifying data with data
+When verifying data, tell the left hand what the right hand is doing, so that errors aren't kept secret...
