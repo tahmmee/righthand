@@ -4,16 +4,25 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"github.com/couchbase/go-couchbase"
 	"github.com/couchbase/gomemcached"
 	"log"
 	"regexp"
+	"strconv"
+	"time"
 )
 
-func connectToBucket(host, name string) *couchbase.Bucket {
+// endpoint connection
+type EndPoint struct {
+	Host   string
+	Bucket string
+}
 
-	c, err := couchbase.Connect(host)
+func (e *EndPoint) Connect() *couchbase.Bucket {
+
+	c, err := couchbase.Connect(e.Host)
 	if err != nil {
 		log.Fatalf("Error connecting:  %v", err)
 	}
@@ -23,7 +32,7 @@ func connectToBucket(host, name string) *couchbase.Bucket {
 		log.Fatalf("Error getting pool:  %v", err)
 	}
 
-	bucket, err := pool.GetBucket(name)
+	bucket, err := pool.GetBucket(e.Bucket)
 	if err != nil {
 		log.Fatalf("Error getting bucket:  %v", err)
 	}
@@ -32,44 +41,109 @@ func connectToBucket(host, name string) *couchbase.Bucket {
 }
 
 func main() {
-	bucket := connectToBucket("http://127.0.0.1:9000/", "default")
-	go streamData()
+	hostName := flag.String("host", "http://127.0.0.1:8091", "host:port to connect to")
+	bucketName := flag.String("bucket", "default", "bucket for data loading")
+	mutationWindow := flag.Int("window", 20, "time between stream sampling")
+	flag.Parse()
 
-	loop := 0
-	for {
-		sum := 0
-		ndocs := 1000
-		for i := 0; i < ndocs; i++ {
-			key := fmt.Sprintf("loop_%d-%s", loop, RandStr(12))
-			doc := make(map[string]interface{})
-			doc["loader"] = "righthand"
-			doc["id"] = fmt.Sprintf("rthkey-%d", i)
-			doc["value"] = i
-			bucket.Set(key, 0, doc)
-			sum += i
-		}
-
-		// view verification
-		viewParams := map[string]interface{}{
-			"stale": false,
-		}
-		res, err := bucket.View("integrity", "values", viewParams)
-		if err != nil {
-			log.Fatalf("Error querying View:  %v", err)
-		}
-		row := res.Rows[0]
-		viewSum := row.Value.(float64)
-		expectedSum := float64(sum)
-		if expectedSum != viewSum {
-			panic("View Sum Should Match KV Sum")
-		}
-
-		loop++
+	endPoint := EndPoint{
+		Host:   *hostName,
+		Bucket: *bucketName,
 	}
+	bucket := endPoint.Connect()
+
+	// start rollback detection
+	var startSequence uint64
+	var endSequence uint64 = 0xFFFFFFFF
+	var highSequenceStat string
+	var lastMutationKey string
+
+	// get current high seqno and vb uuid
+	uuid := GetVBucketStatHighSequence(bucket, "vb_1000:uuid")
+	highSequenceStat = GetVBucketStatHighSequence(bucket, "vb_1000:high_seqno")
+	startSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
+	for {
+
+		if startSequence > endSequence {
+			// rollback detected
+			// should not expect lastMutationKey to be retrievable
+			// this does require that we have seqno up to lastMutationKey
+			panic("VERIFY ROLLBACK!")
+		}
+
+		// let mutations run
+		time.Sleep(time.Second * time.Duration((*mutationWindow)))
+
+		// get new high seqno
+		highSequenceStat = GetVBucketStatHighSequence(bucket, "vb_1000:high_seqno")
+		endSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
+		uuid64, _ := strconv.ParseUint(uuid, 10, 64)
+
+		// stream mutations
+		fmt.Println("STREAM", uuid64, startSequence, endSequence)
+		codeCh := streamVB(bucket, 1000, uuid64, startSequence, endSequence)
+
+		lastMutationKey = <-codeCh
+		fmt.Println(lastMutationKey)
+
+		// set startSequence to endSequence
+		startSequence = endSequence
+	}
+
 }
 
-func streamData() {
-	bucket := connectToBucket("http://127.0.0.1:9000/", "default")
+func streamVB(bucket *couchbase.Bucket, vb uint16, vbuuid, startSequence, endSequence uint64) chan string {
+
+	ch := make(chan string)
+
+	// prepare dcp stream
+	var seq uint32 = 0xFFFF
+	feed, err := bucket.StartUprFeed("rth-integrity", seq)
+	if err != nil {
+		// TODO+ RETRY
+		// log.Fatalf("Error create dcp feed:  %v", err)
+	}
+
+	//vb, flags, opaque, vuuid, startSequence, endSequence, snapStart, snapEnd uint64)
+	err = feed.UprRequestStream(vb, 0, 0, vbuuid, startSequence, endSequence, startSequence, startSequence)
+	if err != nil {
+		log.Fatalf("Error starting dcp stream:  %v", err)
+	}
+
+	go func() {
+
+		// stream all mutations
+		item := <-feed.C
+		opcode := item.Opcode
+		var lastKey string
+		if opcode == gomemcached.UPR_STREAMREQ {
+			for dcpItem := range feed.C {
+				if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
+					break
+				}
+				if dcpItem.Opcode == gomemcached.UPR_MUTATION {
+					key := fmt.Sprintf("%s", dcpItem.Key)
+					seqNo := dcpItem.Seqno
+					value := make(map[string]interface{})
+					if ok := json.Unmarshal(dcpItem.Value, &value); ok == nil {
+						fmt.Println(key, seqNo)
+					}
+					lastKey = key
+				}
+			}
+		} else {
+			panic("REQ FAILED!")
+		}
+
+		// close stream
+		feed.Close()
+		ch <- lastKey
+	}()
+
+	return ch
+}
+
+func streamData(bucket *couchbase.Bucket) {
 
 	// prepare dcp stream
 	var seq uint32 = 0xFFFF
@@ -87,7 +161,7 @@ func streamData() {
 	for dcpItem := range feed.C {
 		fmt.Println(dcpItem.Opcode)
 		if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
-			streamData()
+			streamData(bucket)
 		}
 		if dcpItem.Opcode == gomemcached.UPR_MUTATION {
 			key := fmt.Sprintf("%s", dcpItem.Key)
@@ -99,6 +173,20 @@ func streamData() {
 		}
 	}
 
+}
+
+func GetVBucketStatHighSequence(bucket *couchbase.Bucket, key string) string {
+	var highSequence string
+	stats := bucket.GetStats("vbucket-details")
+	for _, vbStats := range stats {
+		for stat, value := range vbStats {
+			if stat == key {
+				highSequence = value
+				return highSequence
+			}
+		}
+	}
+	return highSequence
 }
 
 func RandStr(size int) string {
