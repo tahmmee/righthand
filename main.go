@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/couchbase/go-couchbase"
@@ -18,6 +19,16 @@ import (
 type EndPoint struct {
 	Host   string
 	Bucket string
+}
+
+type Mutation struct {
+	Key   string
+	SeqNo uint64
+	Value map[string]interface{}
+}
+type StreamMutations struct {
+	Docs    []Mutation
+	VBucket uint16
 }
 
 func (e *EndPoint) Connect() *couchbase.Bucket {
@@ -44,143 +55,163 @@ func main() {
 	hostName := flag.String("host", "http://127.0.0.1:8091", "host:port to connect to")
 	bucketName := flag.String("bucket", "default", "bucket for data loading")
 	mutationWindow := flag.Int("window", 20, "time between stream sampling")
+	loaders := flag.Int("stress", 5, "number of concurrent data loaders")
 	flag.Parse()
 
 	endPoint := EndPoint{
 		Host:   *hostName,
 		Bucket: *bucketName,
 	}
+
+	for i := 0; i < *loaders; i++ {
+		go BgLoader(endPoint)
+	}
+
 	bucket := endPoint.Connect()
+	defer bucket.Close()
 
 	// start rollback detection
 	var startSequence uint64
 	var endSequence uint64 = 0xFFFFFFFF
 	var highSequenceStat string
-	var lastMutationKey string
+	var lastStreamMutations StreamMutations
+	var vb uint16 = 955
 
-	// get current high seqno and vb uuid
-	uuid := GetVBucketStatHighSequence(bucket, "vb_1000:uuid")
-	highSequenceStat = GetVBucketStatHighSequence(bucket, "vb_1000:high_seqno")
+	// get current high seqno
+	highSequenceStat = GetVBucketStat(endPoint, vb, "high_seqno")
 	startSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
+
+	// get current vb uuid
+	uuid := GetVBucketStat(endPoint, vb, "uuid")
+	lastUuid := uuid
+
+	feed, err := bucket.StartUprFeed("rth-integrity", 0xFFFF)
+	logerr(err)
+
 	for {
 
-		if startSequence > endSequence {
-			// rollback detected
-			// should not expect lastMutationKey to be retrievable
-			// this does require that we have seqno up to lastMutationKey
-			panic("VERIFY ROLLBACK!")
+		if lastUuid != uuid { /* vbucket takeover */
+			fmt.Println("VBUCKET Takeover", lastUuid, uuid)
+			// verify data from last stream
+			VerifyLastStreamMutations(endPoint, lastStreamMutations, startSequence, endSequence)
+			lastUuid = uuid
 		}
 
 		// let mutations run
 		time.Sleep(time.Second * time.Duration((*mutationWindow)))
 
 		// get new high seqno
-		highSequenceStat = GetVBucketStatHighSequence(bucket, "vb_1000:high_seqno")
+		highSequenceStat = GetVBucketStat(endPoint, vb, "high_seqno")
 		endSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
 		uuid64, _ := strconv.ParseUint(uuid, 10, 64)
 
 		// stream mutations
-		fmt.Println("STREAM", uuid64, startSequence, endSequence)
-		codeCh := streamVB(bucket, 1000, uuid64, startSequence, endSequence)
+		lastStreamMutations, err = streamVB(feed, vb, uuid64, startSequence, endSequence)
 
-		lastMutationKey = <-codeCh
-		fmt.Println(lastMutationKey)
+		if err != nil {
+			// error
+			fmt.Println("Error during stream request: %s ...reconnecting", err)
+			// create a new stream
+			feed, err = bucket.StartUprFeed("rth-integrity", 0xFFFF)
+		}
 
 		// set startSequence to endSequence
 		startSequence = endSequence
+
+		// update uuid
+		uuid = GetVBucketStat(endPoint, vb, "uuid")
 	}
 
 }
 
-func streamVB(bucket *couchbase.Bucket, vb uint16, vbuuid, startSequence, endSequence uint64) chan string {
-
-	ch := make(chan string)
-
-	// prepare dcp stream
-	var seq uint32 = 0xFFFF
-	feed, err := bucket.StartUprFeed("rth-integrity", seq)
-	if err != nil {
-		// TODO+ RETRY
-		// log.Fatalf("Error create dcp feed:  %v", err)
-	}
-
-	//vb, flags, opaque, vuuid, startSequence, endSequence, snapStart, snapEnd uint64)
-	err = feed.UprRequestStream(vb, 0, 0, vbuuid, startSequence, endSequence, startSequence, startSequence)
-	if err != nil {
-		log.Fatalf("Error starting dcp stream:  %v", err)
-	}
-
-	go func() {
-
-		// stream all mutations
-		item := <-feed.C
-		opcode := item.Opcode
-		var lastKey string
-		if opcode == gomemcached.UPR_STREAMREQ {
-			for dcpItem := range feed.C {
-				if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
-					break
-				}
-				if dcpItem.Opcode == gomemcached.UPR_MUTATION {
-					key := fmt.Sprintf("%s", dcpItem.Key)
-					seqNo := dcpItem.Seqno
-					value := make(map[string]interface{})
-					if ok := json.Unmarshal(dcpItem.Value, &value); ok == nil {
-						fmt.Println(key, seqNo)
-					}
-					lastKey = key
-				}
-			}
-		} else {
-			panic("REQ FAILED!")
+func BgLoader(endPoint EndPoint) {
+	var i uint64 = 0
+	bucket := endPoint.Connect()
+	for {
+		key := fmt.Sprintf("%s-rth_%d", RandStr(12), i)
+		doc := make(map[string]interface{})
+		doc["is_rthloader"] = true
+		doc["id"] = key
+		doc["value"] = i
+		if err := bucket.Set(key, 0, doc); err != nil {
+			fmt.Println("Set err: %s ...reconnecting", err)
+			bucket = endPoint.Connect()
 		}
-
-		// close stream
-		feed.Close()
-		ch <- lastKey
-	}()
-
-	return ch
+		i++
+	}
 }
 
-func streamData(bucket *couchbase.Bucket) {
+func streamVB(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequence uint64) (StreamMutations, error) {
 
-	// prepare dcp stream
-	var seq uint32 = 0xFFFF
-	feed, err := bucket.StartUprFeed("rth-integrity", seq)
-	if err != nil {
-		log.Fatalf("Error create dcp feed:  %v", err)
+	fmt.Println("STREAM: ", vb, vbuuid, startSequence, endSequence)
+
+	mutations := StreamMutations{
+		Docs:    []Mutation{},
+		VBucket: vb,
 	}
 
-	//vb, flags, opaque, vuuid, startSequence, endSequence, snapStart, snapEnd uint64)
-	err = feed.UprRequestStream(1000, 0, 0, 0, 0, 0xFFFFFFFF, 0, 0)
+	err := feed.UprRequestStream(vb, 0, 0, vbuuid, startSequence, endSequence, startSequence, startSequence)
 	if err != nil {
-		log.Fatalf("Error starting dcp stream:  %v", err)
+		//panic(err)
+		return mutations, err
+	}
+	// close stream
+	defer feed.UprCloseStream(vb, 0)
+
+	// stream all mutations
+	item := <-feed.C
+	opcode := item.Opcode
+	if log := item.FailoverLog; log != nil {
+		fmt.Println((*log)[0])
+	}
+	if opcode != gomemcached.UPR_STREAMREQ {
+		emsg := fmt.Sprintf("Invalid stream request: ", opcode)
+		return mutations, errors.New(emsg)
 	}
 
 	for dcpItem := range feed.C {
-		fmt.Println(dcpItem.Opcode)
 		if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
-			streamData(bucket)
+			break
 		}
+
 		if dcpItem.Opcode == gomemcached.UPR_MUTATION {
 			key := fmt.Sprintf("%s", dcpItem.Key)
-			seqNo := dcpItem.Seqno
+			var seqNo uint64 = dcpItem.Seqno
 			value := make(map[string]interface{})
 			if ok := json.Unmarshal(dcpItem.Value, &value); ok == nil {
-				fmt.Println(key, seqNo)
+				if _, exist := value["is_rthloader"]; exist {
+					m := Mutation{
+						Key:   key,
+						SeqNo: seqNo,
+						Value: value,
+					}
+					mutations.Docs = append(mutations.Docs, m)
+				}
 			}
 		}
 	}
-
+	return mutations, nil
 }
 
-func GetVBucketStatHighSequence(bucket *couchbase.Bucket, key string) string {
+func VerifyLastStreamMutations(endPoint EndPoint, mutations StreamMutations, startSequence, endSequence uint64) {
+	fmt.Println(startSequence, endSequence)
+
+	// get new high seqNo
+	highSequenceStat := GetVBucketStat(endPoint, mutations.VBucket, "high_seqno")
+	// newHighSequence, _ := strconv.ParseUint(highSequenceStat, 10, 64)
+	panic("VERIFY TAKEVOER! " + highSequenceStat)
+}
+
+func GetVBucketStat(endPoint EndPoint, vb uint16, key string) string {
+	bucket := endPoint.Connect()
+	defer bucket.Close()
+
 	var highSequence string
+	statKey := fmt.Sprintf("vb_%d:%s", vb, key)
 	stats := bucket.GetStats("vbucket-details")
 	for _, vbStats := range stats {
 		for stat, value := range vbStats {
-			if stat == key {
+			if stat == statKey {
 				highSequence = value
 				return highSequence
 			}
@@ -205,6 +236,11 @@ func logerr(err error) {
 	}
 }
 
+/* failover log entry:
+[[251713123684111 1173534] [116833564910019 1085339]
+	* means that the latest vbuiid took over at 1173534
+	* which means that many mutations on last vbuuid are gone
+*/
 // keep concurrent map of key:seqno across snapshots
 // whenever a stream ends - restart
 // on stream start check to see last known seqno of vb
