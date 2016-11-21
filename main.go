@@ -31,6 +31,13 @@ type StreamMutations struct {
 	VBucket uint16
 }
 
+func NewStreamMutations(vb uint16) StreamMutations {
+	return StreamMutations{
+		Docs:    []Mutation{},
+		VBucket: vb,
+	}
+}
+
 func (e *EndPoint) Connect() *couchbase.Bucket {
 
 	c, err := couchbase.Connect(e.Host)
@@ -54,7 +61,6 @@ func (e *EndPoint) Connect() *couchbase.Bucket {
 func main() {
 	hostName := flag.String("host", "http://127.0.0.1:8091", "host:port to connect to")
 	bucketName := flag.String("bucket", "default", "bucket for data loading")
-	mutationWindow := flag.Int("window", 20, "time between stream sampling")
 	loaders := flag.Int("stress", 5, "number of concurrent data loaders")
 	flag.Parse()
 
@@ -75,51 +81,50 @@ func main() {
 	var endSequence uint64 = 0xFFFFFFFF
 	var highSequenceStat string
 	var lastStreamMutations StreamMutations
-	var vb uint16 = 955
-
-	// get current high seqno
-	highSequenceStat = GetVBucketStat(endPoint, vb, "high_seqno")
-	startSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
+	var vb uint16 = 0
 
 	// get current vb uuid
 	uuid := GetVBucketStat(endPoint, vb, "uuid")
-	lastUuid := uuid
 
+	// start upr feed
 	feed, err := bucket.StartUprFeed("rth-integrity", 0xFFFF)
 	logerr(err)
 
 	for {
 
-		if lastUuid != uuid { /* vbucket takeover */
-			fmt.Println("VBUCKET Takeover", lastUuid, uuid)
-			// verify data from last stream
-			VerifyLastStreamMutations(endPoint, lastStreamMutations, startSequence, endSequence)
-			lastUuid = uuid
-		}
-
-		// let mutations run
-		time.Sleep(time.Second * time.Duration((*mutationWindow)))
-
-		// get new high seqno
+		// get current high seqno as stream start
 		highSequenceStat = GetVBucketStat(endPoint, vb, "high_seqno")
-		endSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
+		startSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
+
 		uuid64, _ := strconv.ParseUint(uuid, 10, 64)
 
 		// stream mutations
-		lastStreamMutations, err = streamVB(feed, vb, uuid64, startSequence, endSequence)
+		streamCh, err := streamVB(feed, vb, uuid64, startSequence, 0xFFFFFFFF)
 
 		if err != nil {
 			// error
 			fmt.Println("Error during stream request: %s ...reconnecting", err)
-			// create a new stream
 			feed, err = bucket.StartUprFeed("rth-integrity", 0xFFFF)
+		} else {
+
+			streamMutations := <-streamCh
+			if len(streamMutations.Docs) > 0 {
+				lastStreamMutations = streamMutations
+			}
+		}
+		if len(lastStreamMutations.Docs) > 0 {
+			m := lastStreamMutations.Docs[len(lastStreamMutations.Docs)-1]
+			fmt.Println(m.Key, m.SeqNo)
 		}
 
-		// set startSequence to endSequence
-		startSequence = endSequence
-
 		// update uuid
-		uuid = GetVBucketStat(endPoint, vb, "uuid")
+		newUuid := GetVBucketStat(endPoint, vb, "uuid")
+		if newUuid != uuid { /* vbucket takeover */
+			fmt.Println("VBUCKET Takeover", newUuid, uuid)
+			// verify data from last stream
+			VerifyLastStreamMutations(endPoint, lastStreamMutations, startSequence, endSequence)
+			uuid = newUuid
+		}
 	}
 
 }
@@ -134,29 +139,23 @@ func BgLoader(endPoint EndPoint) {
 		doc["id"] = key
 		doc["value"] = i
 		if err := bucket.Set(key, 0, doc); err != nil {
-			fmt.Println("Set err: %s ...reconnecting", err)
 			bucket = endPoint.Connect()
 		}
 		i++
 	}
 }
 
-func streamVB(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequence uint64) (StreamMutations, error) {
+func streamVB(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequence uint64) (chan StreamMutations, error) {
 
 	fmt.Println("STREAM: ", vb, vbuuid, startSequence, endSequence)
 
-	mutations := StreamMutations{
-		Docs:    []Mutation{},
-		VBucket: vb,
-	}
+	mutationsCh := make(chan StreamMutations)
+	mutations := NewStreamMutations(vb)
 
 	err := feed.UprRequestStream(vb, 0, 0, vbuuid, startSequence, endSequence, startSequence, startSequence)
 	if err != nil {
-		//panic(err)
-		return mutations, err
+		return mutationsCh, err
 	}
-	// close stream
-	defer feed.UprCloseStream(vb, 0)
 
 	// stream all mutations
 	item := <-feed.C
@@ -166,40 +165,95 @@ func streamVB(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequ
 	}
 	if opcode != gomemcached.UPR_STREAMREQ {
 		emsg := fmt.Sprintf("Invalid stream request: ", opcode)
-		return mutations, errors.New(emsg)
+		return mutationsCh, errors.New(emsg)
 	}
 
-	for dcpItem := range feed.C {
-		if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
-			break
-		}
+	go func() {
 
-		if dcpItem.Opcode == gomemcached.UPR_MUTATION {
-			key := fmt.Sprintf("%s", dcpItem.Key)
-			var seqNo uint64 = dcpItem.Seqno
-			value := make(map[string]interface{})
-			if ok := json.Unmarshal(dcpItem.Value, &value); ok == nil {
-				if _, exist := value["is_rthloader"]; exist {
-					m := Mutation{
-						Key:   key,
-						SeqNo: seqNo,
-						Value: value,
-					}
-					mutations.Docs = append(mutations.Docs, m)
+		// close stream whenever streaming is done
+		defer feed.UprCloseStream(vb, 0)
+
+		maxMutations := 100
+		for {
+			select {
+			case dcpItem := <-feed.C:
+				if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
+					mutationsCh <- mutations
+					return
 				}
+
+				if dcpItem.Opcode == gomemcached.UPR_MUTATION {
+					key := fmt.Sprintf("%s", dcpItem.Key)
+					var seqNo uint64 = dcpItem.Seqno
+					value := make(map[string]interface{})
+					if ok := json.Unmarshal(dcpItem.Value, &value); ok == nil {
+						if _, exist := value["is_rthloader"]; exist {
+							m := Mutation{
+								Key:   key,
+								SeqNo: seqNo,
+								Value: value,
+							}
+							if len(mutations.Docs) > maxMutations {
+								mutations.Docs = []Mutation{m}
+							} else {
+								mutations.Docs = append(mutations.Docs, m)
+							}
+						}
+					}
+				}
+			case <-time.After(time.Second * 5):
+				// no item in 5 seconds then give up
+				fmt.Println("TIMEOUT!")
+				mutationsCh <- mutations
+				return
 			}
 		}
-	}
-	return mutations, nil
+	}()
+	return mutationsCh, nil
 }
 
 func VerifyLastStreamMutations(endPoint EndPoint, mutations StreamMutations, startSequence, endSequence uint64) {
-	fmt.Println(startSequence, endSequence)
+
+	vb := mutations.VBucket
+
+	// get takeover seqno from new failover log
+	takeoverSequenceStat := GetVBFailoverSequence(endPoint, vb, "0")
+	takeoverSequence, _ := strconv.ParseUint(takeoverSequenceStat, 10, 64)
+
+	fmt.Println("TAKEVOER", takeoverSequence, "START", startSequence, "END", endSequence)
+	// get all keys higher than takeover seqno which should be rolled back
+	rollbackDocs := []Mutation{}
+	for _, m := range mutations.Docs {
+		fmt.Println(m.SeqNo, m.Key)
+		if m.SeqNo > takeoverSequence {
+			rollbackDocs = append(rollbackDocs, m)
+			fmt.Println("Rollback: ", m.Key)
+		}
+	}
+	// all of these keys should be missing
+	// verify kv
+	// verify views
+	// verify index
+	// keys prior to takeover seqno should be present
 
 	// get new high seqNo
-	highSequenceStat := GetVBucketStat(endPoint, mutations.VBucket, "high_seqno")
-	// newHighSequence, _ := strconv.ParseUint(highSequenceStat, 10, 64)
-	panic("VERIFY TAKEVOER! " + highSequenceStat)
+	// uuid := GetVBucketStat(endPoint, mutations.VBucket, "uuid")
+	// panic("VERIFY TAKEVOER! " + uuid + " : " + takeoverSequenceStat)
+}
+
+func GetVBFailoverSequence(endPoint EndPoint, vb uint16, entry string) string {
+	bucket := endPoint.Connect()
+	defer bucket.Close()
+
+	var failoverSequence string
+	statKey := fmt.Sprintf("vb_%d:%s:seq", vb, entry)
+	stats := bucket.GetStats("failovers")
+	for _, vbStats := range stats {
+		failoverSequence = vbStats[statKey]
+		break
+	}
+
+	return failoverSequence
 }
 
 func GetVBucketStat(endPoint EndPoint, vb uint16, key string) string {
@@ -235,14 +289,3 @@ func logerr(err error) {
 		log.Fatalf("Error occurred:  %v", err)
 	}
 }
-
-/* failover log entry:
-[[251713123684111 1173534] [116833564910019 1085339]
-	* means that the latest vbuiid took over at 1173534
-	* which means that many mutations on last vbuuid are gone
-*/
-// keep concurrent map of key:seqno across snapshots
-// whenever a stream ends - restart
-// on stream start check to see last known seqno of vb
-// if first seqno is < last seqno then some other clients did a rollback
-// 		verification: make sure rolledback keys are missing from mc, view, n1ql
