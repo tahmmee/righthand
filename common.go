@@ -7,6 +7,13 @@ import (
 	"regexp"
 )
 
+const (
+	ROLLBACK_OK        = iota
+	ROLLBACK_FAIL      = iota
+	ERR_STREAM_FAILED  = iota
+	ERR_NO_VB_TAKEOVER = iota
+)
+
 func RandStr(size int) string {
 	rb := make([]byte, size)
 	_, err := rand.Read(rb)

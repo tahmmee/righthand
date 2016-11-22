@@ -54,7 +54,7 @@ func (s *StreamManager) GenerateMutations() {
 	bucket.Close()
 }
 
-func (s *StreamManager) VerifyVBucket(vb uint16) {
+func (s *StreamManager) VerifyVBucket(vb uint16) int {
 
 	bucket := s.endPoint.Bucket()
 	stats := NewVBucketStats(s.endPoint)
@@ -88,33 +88,24 @@ func (s *StreamManager) VerifyVBucket(vb uint16) {
 	if err != nil {
 		// error
 		fmt.Println("Error during stream request: %s", err)
-		//feed, err = bucket.StartUprFeed("rth-integrity", 0xFFFF)
-		// return
-	} else {
-
-		streamMutations := <-streamCh
-		if len(streamMutations.Docs) > 0 {
-			lastStreamMutations = streamMutations
-		}
-	}
-	if len(lastStreamMutations.Docs) > 0 {
-		m := lastStreamMutations.Docs[len(lastStreamMutations.Docs)-1]
-		fmt.Println(m.Key, m.SeqNo)
+		return ERR_STREAM_FAILED
 	}
 
-	// update uuid
+	lastStreamMutations = <-streamCh
+
+	// detect if uuid changed (ie.. vbucket takeover)
 	newUuid := stats.UUID(vb)
-	if newUuid != uuid { /* vbucket takeover */
-		fmt.Println("VBUCKET Takeover", newUuid, uuid)
-		// verify data from last stream
-		s.VerifyLastStreamMutations(lastStreamMutations, startSequence, endSequence)
-		uuid = newUuid
+	if newUuid == uuid {
+		// did not verify a takeover phase
+		fmt.Println("stream ended without a takeover occurring")
+		return ERR_NO_VB_TAKEOVER
 	}
+
+	// verify takeover
+	return s.VerifyLastStreamMutations(lastStreamMutations, startSequence, endSequence)
 }
 
 func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequence uint64) (chan StreamMutations, error) {
-
-	fmt.Println("STREAM: ", vb, vbuuid, startSequence, endSequence)
 
 	mutationsCh := make(chan StreamMutations)
 	mutations := NewStreamMutations(vb)
@@ -122,6 +113,8 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 	err := feed.UprRequestStream(vb, 0, 0, vbuuid, startSequence, endSequence, startSequence, startSequence)
 	if err != nil {
 		return mutationsCh, err
+	} else {
+		fmt.Println("Streaming: ", vb, vbuuid, startSequence, endSequence)
 	}
 
 	// stream all mutations
@@ -141,10 +134,14 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 		defer feed.UprCloseStream(vb, 0)
 
 		maxMutations := 100
+		cachedMutations := []Mutation{}
 		for {
 			select {
 			case dcpItem := <-feed.C:
 				if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
+
+					// prepend with cached mutations
+					mutations.Docs = append(cachedMutations, mutations.Docs[0:]...)
 					mutationsCh <- mutations
 					return
 				}
@@ -161,6 +158,7 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 								Value: value,
 							}
 							if len(mutations.Docs) > maxMutations {
+								cachedMutations = mutations.Docs
 								mutations.Docs = []Mutation{m}
 							} else {
 								mutations.Docs = append(mutations.Docs, m)
@@ -170,7 +168,7 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 				}
 			case <-time.After(time.Second * 5):
 				// no item in 5 seconds then give up
-				fmt.Println("TIMEOUT!")
+				mutations.Docs = append(cachedMutations, mutations.Docs[0:]...)
 				mutationsCh <- mutations
 				return
 			}
@@ -179,16 +177,16 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 	return mutationsCh, nil
 }
 
-func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, startSequence, endSequence uint64) {
+func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, startSequence, endSequence uint64) int {
 
 	vb := mutations.VBucket
-	statHelper := NewVBucketStats(s.endPoint)
+	stats := NewVBucketStats(s.endPoint)
 
 	// get takeover seqno from new failover log
-	takeoverSequenceStat := statHelper.FailoverSequence(vb, "0")
+	takeoverSequenceStat := stats.FailoverSequence(vb, "0")
 	takeoverSequence, _ := strconv.ParseUint(takeoverSequenceStat, 10, 64)
+	fmt.Println("Verify takover occurred at sequence: ", takeoverSequence)
 
-	fmt.Println("TAKEVOER", takeoverSequence, "START", startSequence, "END", endSequence)
 	// get all keys higher than takeover seqno which should be rolled back
 	rollbackDocs := []Mutation{}
 	for _, m := range mutations.Docs {
@@ -198,6 +196,8 @@ func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, sta
 			fmt.Println("Rollback: ", m.Key)
 		}
 	}
+
+	return ROLLBACK_OK
 	// all of these keys should be missing
 	// verify kv
 	// verify views

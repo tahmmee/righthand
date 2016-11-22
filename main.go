@@ -4,6 +4,7 @@ import (
 	"flag"
 	"github.com/couchbase/go-couchbase"
 	"log"
+	"os"
 )
 
 // endpoint connection
@@ -42,16 +43,16 @@ func (e *EndPoint) Bucket() *couchbase.Bucket {
 func main() {
 	hostName := flag.String("host", "http://127.0.0.1:8091", "host:port to connect to")
 	bucketName := flag.String("bucket", "default", "bucket for data loading")
-	loaders := flag.Int("stress", 5, "number of concurrent data loaders")
+	stress := flag.Int("stress", 5, "number of concurrent data loaders")
 	flag.Parse()
 
 	endPoint := NewEndPoint(*hostName, *bucketName)
 	streamer := NewStreamManager(endPoint)
 
-	for i := 0; i < *loaders; i++ {
+	for i := 0; i < *stress; i++ {
 		go streamer.GenerateMutations()
 	}
 
-	streamer.VerifyVBucket(0)
-
+	rc := streamer.VerifyVBucket(0)
+	os.Exit(rc)
 }
