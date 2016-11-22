@@ -48,6 +48,7 @@ func main() {
 	bucketName := flag.String("bucket", "default", "bucket for data loading")
 	stress := flag.Int("stress", 5, "number of concurrent data loaders")
 	vb := flag.Uint("vbucket", 0, "vbucket to verify")
+	no_takeover := flag.Bool("no_takeover", false, "wether vbucket takeover is expected")
 	flag.Parse()
 
 	endPoint := NewEndPoint(*hostName, *queryHost, *bucketName)
@@ -61,5 +62,11 @@ func main() {
 	}
 
 	rc := streamer.VerifyVBucket(uint16(*vb))
+	if *(no_takeover) == true { // not expecting a takeover
+		if rc == ERR_NO_VB_TAKEOVER {
+			rc = ROLLBACK_OK // and takeover did not happen as expected
+		}
+	}
+
 	os.Exit(rc)
 }

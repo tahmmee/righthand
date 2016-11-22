@@ -133,7 +133,7 @@ func (s *StreamManager) VerifyVBucket(vb uint16) int {
 
 		// retry wait
 		time.Sleep(time.Second * 5)
-		fmt.Println("Expected change in uuid... retry", uuid)
+		fmt.Println("Waiting for change in uuid... retry", uuid)
 	}
 
 	if !didVBTakover {
@@ -179,7 +179,8 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 		for {
 			select {
 			case dcpItem := <-feed.C:
-				if dcpItem.Opcode == gomemcached.UPR_STREAMEND {
+
+				if dcpItem == nil || dcpItem.Opcode == gomemcached.UPR_STREAMEND {
 
 					// prepend with cached mutations
 					mutations.Docs = append(cachedMutations, mutations.Docs[0:]...)
@@ -220,52 +221,69 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 
 func (s *StreamManager) VerifyViewDocs(docs []Mutation, shouldExist bool) bool {
 	bucket := s.endPoint.Bucket()
-
 	for _, doc := range docs {
-		viewParams := map[string]interface{}{
-			"stale": false,
-			"key":   doc.Key,
-		}
-
-		res, err := bucket.View("integrity", "values", viewParams)
-		if err != nil {
-			fmt.Println("Error querying View:  %v", err)
+		res, ok := s.doViewQuery(bucket, doc.Key, 30, 5)
+		if ok == false {
 			return false
 		}
-		row := res.Rows[0]
-		fmt.Println(row)
-		//viewSum := row.Value.(float64)
-		//expectedSum := float64(sum)
+
+		nRows := len(res.Rows)
+		if shouldExist && nRows == 0 {
+			fmt.Println("ERROR [view]: expected doc to exist after rollback", doc.Key)
+			return false
+		}
+		if shouldExist == false && nRows > 0 {
+			fmt.Println("ERROR [kv]: expected rollback doc to be deleted", doc.Key)
+			return false
+		}
+		fmt.Printf("ok [view] %s exists: %t, expected: %t\n", doc.Key, nRows > 0, shouldExist)
+
 	}
 
 	return true
 }
 
-func (s *StreamManager) VerifyKVDocs(docs []Mutation, shouldExist bool) bool {
-	bucket := s.endPoint.Bucket()
-	rdoc := make(map[string]interface{})
+func (s *StreamManager) doViewQuery(bucket *couchbase.Bucket, key string, timeout, retries int) (couchbase.ViewResult, bool) {
 
-	// get doc from mcd engine
-	for _, doc := range docs {
-		if err := bucket.Get(doc.Key, &rdoc); err != nil {
-			// doc exists
-			if shouldExist == false {
-				// but doc should not exist
-				fmt.Println("ERROR [kv]: expected rollback doc to be deleted", doc.Key)
-				return false
+	var res couchbase.ViewResult
+	resCh := make(chan couchbase.ViewResult)
+	viewParams := map[string]interface{}{
+		"stale":              false,
+		"key":                key,
+		"connection_timeout": timeout,
+	}
+
+	go func() {
+		var e error
+		res, e = bucket.View("integrity", "values", viewParams)
+		logerr(e)
+		resCh <- res
+	}()
+
+	select {
+	case res := <-resCh:
+		// check for errors in result
+		for _, err := range res.Errors {
+			// if we got a timeout then retry
+			if err.Reason == "timeout" {
+				if retries > 0 {
+					fmt.Println("view query timeout... retry", retries)
+					return s.doViewQuery(bucket, key, timeout, retries-1)
+				} else {
+					return res, false
+				}
 			}
-		} else {
-			// doc is missing
-			if shouldExist == true {
-				// but doc should exist
-				fmt.Println("ERROR [kv]: expected doc to exist after rollback", doc.Key)
-				return false
-			}
+		}
+	case <-time.After(time.Second * time.Duration(timeout)):
+		if retries > 0 {
+			fmt.Println("view engine not responding... retry", retries)
+			return s.doViewQuery(bucket, key, timeout, retries-1)
 		}
 	}
 
-	return true
+	return res, true
 }
+
 func (s *StreamManager) VerifyQueryDocs(docs []Mutation, shouldExist bool) bool {
 
 	uri := fmt.Sprintf("%s/query/service", s.endPoint.QueryHost)
@@ -290,7 +308,6 @@ func (s *StreamManager) VerifyQueryDocs(docs []Mutation, shouldExist bool) bool 
 		// expect resultCount = 0
 		metrics := v["metrics"].(map[string]interface{})
 		nDocs := metrics["resultCount"].(float64)
-		fmt.Println("Query resultCount shouldExist?", nDocs, shouldExist)
 		if shouldExist && nDocs == 0 {
 			fmt.Printf("ERROR [2i]: expected key (%s | %d) to exist after rollback \n", doc.Key, doc.SeqNo)
 			return false
@@ -299,6 +316,34 @@ func (s *StreamManager) VerifyQueryDocs(docs []Mutation, shouldExist bool) bool 
 			fmt.Printf("ERROR [2i]: expected key (%s | %d) to be removed after rollback\n", doc.Key, doc.SeqNo)
 			return false
 		}
+		fmt.Printf("ok [2i] %s exists: %t, expected: %t\n", doc.Key, nDocs > 0, shouldExist)
+	}
+
+	return true
+}
+
+func (s *StreamManager) VerifyKVDocs(docs []Mutation, shouldExist bool) bool {
+	bucket := s.endPoint.Bucket()
+	rdoc := make(map[string]interface{})
+
+	// get doc from mcd engine
+	for _, doc := range docs {
+		err := bucket.Get(doc.Key, &rdoc)
+		exists := err == nil
+		if exists == true {
+			if shouldExist == false {
+				// doc exists but should not
+				fmt.Println("ERROR [kv]: expected rollback doc to be deleted", doc.Key)
+				return false
+			}
+		} else {
+			if shouldExist == true {
+				// doc is missing but should exist
+				fmt.Println("ERROR [kv]: expected doc to exist after rollback", doc.Key)
+				return false
+			}
+		}
+		fmt.Printf("ok [kv] %s exists: %t, expected: %t\n", doc.Key, exists, shouldExist)
 	}
 
 	return true
@@ -337,18 +382,12 @@ func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, sta
 
 func (s *StreamManager) VerifyEngines(rollbackDocs, persistedDocs []Mutation) int {
 
-	// view expect rollback docs to be missing
-	if ok := s.VerifyViewDocs(rollbackDocs, false); ok == false {
-		return ERR_ROLLBACK_FAIL
-	}
-
 	// view expect persisted docs to be present
 	if ok := s.VerifyViewDocs(persistedDocs, true); ok == false {
 		return ERR_ROLLBACK_FAIL
 	}
-
-	// 2i expect rollback docs to be missing
-	if ok := s.VerifyQueryDocs(rollbackDocs, false); ok == false {
+	// view expect rollback docs to be missing
+	if ok := s.VerifyViewDocs(rollbackDocs, false); ok == false {
 		return ERR_ROLLBACK_FAIL
 	}
 
@@ -356,14 +395,17 @@ func (s *StreamManager) VerifyEngines(rollbackDocs, persistedDocs []Mutation) in
 	if ok := s.VerifyQueryDocs(persistedDocs, true); ok == false {
 		return ERR_ROLLBACK_FAIL
 	}
-
-	// kv expect rollback docs to be missing
-	if ok := s.VerifyKVDocs(rollbackDocs, false); ok == false {
+	// 2i expect rollback docs to be missing
+	if ok := s.VerifyQueryDocs(rollbackDocs, false); ok == false {
 		return ERR_ROLLBACK_FAIL
 	}
 
 	// kv expect persisted docs to be present
 	if ok := s.VerifyKVDocs(persistedDocs, true); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+	// kv expect rollback docs to be missing
+	if ok := s.VerifyKVDocs(rollbackDocs, false); ok == false {
 		return ERR_ROLLBACK_FAIL
 	}
 
