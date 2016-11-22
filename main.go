@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,15 +8,41 @@ import (
 	"github.com/couchbase/go-couchbase"
 	"github.com/couchbase/gomemcached"
 	"log"
-	"regexp"
 	"strconv"
 	"time"
 )
 
 // endpoint connection
 type EndPoint struct {
-	Host   string
-	Bucket string
+	Host       string
+	BucketName string
+}
+
+func NewEndPoint(host, bucket string) *EndPoint {
+	return &EndPoint{
+		Host:       host,
+		BucketName: bucket,
+	}
+}
+
+func (e *EndPoint) Bucket() *couchbase.Bucket {
+
+	c, err := couchbase.Connect(e.Host)
+	if err != nil {
+		log.Fatalf("Error connecting:  %v", err)
+	}
+
+	pool, err := c.GetPool("default")
+	if err != nil {
+		log.Fatalf("Error getting pool:  %v", err)
+	}
+
+	bucket, err := pool.GetBucket(e.BucketName)
+	if err != nil {
+		log.Fatalf("Error getting bucket:  %v", err)
+	}
+
+	return bucket
 }
 
 type Mutation struct {
@@ -37,43 +61,20 @@ func NewStreamMutations(vb uint16) StreamMutations {
 		VBucket: vb,
 	}
 }
-
-func (e *EndPoint) Connect() *couchbase.Bucket {
-
-	c, err := couchbase.Connect(e.Host)
-	if err != nil {
-		log.Fatalf("Error connecting:  %v", err)
-	}
-
-	pool, err := c.GetPool("default")
-	if err != nil {
-		log.Fatalf("Error getting pool:  %v", err)
-	}
-
-	bucket, err := pool.GetBucket(e.Bucket)
-	if err != nil {
-		log.Fatalf("Error getting bucket:  %v", err)
-	}
-
-	return bucket
-}
-
 func main() {
 	hostName := flag.String("host", "http://127.0.0.1:8091", "host:port to connect to")
 	bucketName := flag.String("bucket", "default", "bucket for data loading")
 	loaders := flag.Int("stress", 5, "number of concurrent data loaders")
 	flag.Parse()
 
-	endPoint := EndPoint{
-		Host:   *hostName,
-		Bucket: *bucketName,
-	}
+	endPoint := NewEndPoint(*hostName, *bucketName)
+	stats := NewVBucketStats(endPoint)
 
 	for i := 0; i < *loaders; i++ {
 		go BgLoader(endPoint)
 	}
 
-	bucket := endPoint.Connect()
+	bucket := endPoint.Bucket()
 	defer bucket.Close()
 
 	// start rollback detection
@@ -84,7 +85,7 @@ func main() {
 	var vb uint16 = 0
 
 	// get current vb uuid
-	uuid := GetVBucketStat(endPoint, vb, "uuid")
+	uuid := stats.UUID(vb)
 
 	// start upr feed
 	feed, err := bucket.StartUprFeed("rth-integrity", 0xFFFF)
@@ -93,7 +94,7 @@ func main() {
 	for {
 
 		// get current high seqno as stream start
-		highSequenceStat = GetVBucketStat(endPoint, vb, "high_seqno")
+		highSequenceStat = stats.HighSequence(vb)
 		startSequence, _ = strconv.ParseUint(highSequenceStat, 10, 64)
 
 		uuid64, _ := strconv.ParseUint(uuid, 10, 64)
@@ -118,7 +119,7 @@ func main() {
 		}
 
 		// update uuid
-		newUuid := GetVBucketStat(endPoint, vb, "uuid")
+		newUuid := stats.UUID(vb)
 		if newUuid != uuid { /* vbucket takeover */
 			fmt.Println("VBUCKET Takeover", newUuid, uuid)
 			// verify data from last stream
@@ -129,9 +130,9 @@ func main() {
 
 }
 
-func BgLoader(endPoint EndPoint) {
+func BgLoader(endPoint *EndPoint) {
 	var i uint64 = 0
-	bucket := endPoint.Connect()
+	bucket := endPoint.Bucket()
 	for {
 		key := fmt.Sprintf("%s-rth_%d", RandStr(12), i)
 		doc := make(map[string]interface{})
@@ -139,10 +140,13 @@ func BgLoader(endPoint EndPoint) {
 		doc["id"] = key
 		doc["value"] = i
 		if err := bucket.Set(key, 0, doc); err != nil {
-			bucket = endPoint.Connect()
+			bucket.Close()
+			bucket = endPoint.Bucket()
 		}
 		i++
 	}
+
+	bucket.Close()
 }
 
 func streamVB(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequence uint64) (chan StreamMutations, error) {
@@ -212,12 +216,13 @@ func streamVB(feed *couchbase.UprFeed, vb uint16, vbuuid, startSequence, endSequ
 	return mutationsCh, nil
 }
 
-func VerifyLastStreamMutations(endPoint EndPoint, mutations StreamMutations, startSequence, endSequence uint64) {
+func VerifyLastStreamMutations(endPoint *EndPoint, mutations StreamMutations, startSequence, endSequence uint64) {
 
 	vb := mutations.VBucket
+	statHelper := NewVBucketStats(endPoint)
 
 	// get takeover seqno from new failover log
-	takeoverSequenceStat := GetVBFailoverSequence(endPoint, vb, "0")
+	takeoverSequenceStat := statHelper.FailoverSequence(vb, "0")
 	takeoverSequence, _ := strconv.ParseUint(takeoverSequenceStat, 10, 64)
 
 	fmt.Println("TAKEVOER", takeoverSequence, "START", startSequence, "END", endSequence)
@@ -239,53 +244,4 @@ func VerifyLastStreamMutations(endPoint EndPoint, mutations StreamMutations, sta
 	// get new high seqNo
 	// uuid := GetVBucketStat(endPoint, mutations.VBucket, "uuid")
 	// panic("VERIFY TAKEVOER! " + uuid + " : " + takeoverSequenceStat)
-}
-
-func GetVBFailoverSequence(endPoint EndPoint, vb uint16, entry string) string {
-	bucket := endPoint.Connect()
-	defer bucket.Close()
-
-	var failoverSequence string
-	statKey := fmt.Sprintf("vb_%d:%s:seq", vb, entry)
-	stats := bucket.GetStats("failovers")
-	for _, vbStats := range stats {
-		failoverSequence = vbStats[statKey]
-		break
-	}
-
-	return failoverSequence
-}
-
-func GetVBucketStat(endPoint EndPoint, vb uint16, key string) string {
-	bucket := endPoint.Connect()
-	defer bucket.Close()
-
-	var highSequence string
-	statKey := fmt.Sprintf("vb_%d:%s", vb, key)
-	stats := bucket.GetStats("vbucket-details")
-	for _, vbStats := range stats {
-		for stat, value := range vbStats {
-			if stat == statKey {
-				highSequence = value
-				return highSequence
-			}
-		}
-	}
-	return highSequence
-}
-
-func RandStr(size int) string {
-	rb := make([]byte, size)
-	_, err := rand.Read(rb)
-	logerr(err)
-	str := base64.URLEncoding.EncodeToString(rb)
-	reg, err := regexp.Compile("[^A-Za-z0-9]+")
-	logerr(err)
-	return reg.ReplaceAllString(str, "")
-}
-
-func logerr(err error) {
-	if err != nil {
-		log.Fatalf("Error occurred:  %v", err)
-	}
 }
