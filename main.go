@@ -11,12 +11,14 @@ import (
 type EndPoint struct {
 	Host       string
 	BucketName string
+	QueryHost  string
 }
 
-func NewEndPoint(host, bucket string) *EndPoint {
+func NewEndPoint(host, queryHost, bucket string) *EndPoint {
 	return &EndPoint{
 		Host:       host,
 		BucketName: bucket,
+		QueryHost:  queryHost,
 	}
 }
 
@@ -41,18 +43,23 @@ func (e *EndPoint) Bucket() *couchbase.Bucket {
 }
 
 func main() {
-	hostName := flag.String("host", "http://127.0.0.1:8091", "host:port to connect to")
+	hostName := flag.String("host", "http://127.0.0.1:8091", "data host:port to connect to")
+	queryHost := flag.String("query", "http://127.0.0.1:8093", "query host:port to connect to")
 	bucketName := flag.String("bucket", "default", "bucket for data loading")
 	stress := flag.Int("stress", 5, "number of concurrent data loaders")
+	vb := flag.Uint("vbucket", 0, "vbucket to verify")
 	flag.Parse()
 
-	endPoint := NewEndPoint(*hostName, *bucketName)
+	endPoint := NewEndPoint(*hostName, *queryHost, *bucketName)
 	streamer := NewStreamManager(endPoint)
+	if err := streamer.CreateIndexes(); err != nil {
+		os.Exit(ERR_INDEX_CREATE)
+	}
 
 	for i := 0; i < *stress; i++ {
 		go streamer.GenerateMutations()
 	}
 
-	rc := streamer.VerifyVBucket(0)
+	rc := streamer.VerifyVBucket(uint16(*vb))
 	os.Exit(rc)
 }

@@ -6,16 +6,23 @@ import (
 	"fmt"
 	"github.com/couchbase/go-couchbase"
 	"github.com/couchbase/gomemcached"
+	"io/ioutil"
+	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
 
 type StreamManager struct {
-	endPoint *EndPoint
+	endPoint    *EndPoint
+	StreamEnded bool
 }
 
 func NewStreamManager(endPoint *EndPoint) *StreamManager {
-	return &StreamManager{endPoint: endPoint}
+	return &StreamManager{
+		endPoint:    endPoint,
+		StreamEnded: false,
+	}
 }
 
 type Mutation struct {
@@ -38,7 +45,7 @@ func NewStreamMutations(vb uint16) StreamMutations {
 func (s *StreamManager) GenerateMutations() {
 	var i uint64 = 0
 	bucket := s.endPoint.Bucket()
-	for {
+	for s.StreamEnded == false {
 		key := fmt.Sprintf("%s-rth_%d", RandStr(12), i)
 		doc := make(map[string]interface{})
 		doc["is_rthloader"] = true
@@ -54,6 +61,26 @@ func (s *StreamManager) GenerateMutations() {
 	bucket.Close()
 }
 
+func (s *StreamManager) CreateIndexes() error {
+
+	// view
+	bucket := s.endPoint.Bucket()
+	ddoc := `{"views":{"values":{"map":"function(doc, meta){ if(doc.is_rthloader){  emit(meta.id, doc.value); } }"}}} `
+	if err := bucket.PutDDoc("integrity", ddoc); err != nil {
+		fmt.Println("unable to create view", err)
+		return err
+	}
+
+	// 2i
+	uri := fmt.Sprintf("%s/query/service", s.endPoint.QueryHost)
+	params := url.Values{"statement": {"create index rth_id on `default`(id)"}}
+	if _, err := http.PostForm(uri, params); err != nil {
+		fmt.Println("unable to create index", err)
+		return err
+	}
+
+	return nil
+}
 func (s *StreamManager) VerifyVBucket(vb uint16) int {
 
 	bucket := s.endPoint.Bucket()
@@ -92,6 +119,8 @@ func (s *StreamManager) VerifyVBucket(vb uint16) int {
 	}
 
 	lastStreamMutations = <-streamCh
+
+	s.StreamEnded = true
 
 	// detect if uuid changed (ie.. vbucket takeover)
 	didVBTakover := false
@@ -189,6 +218,92 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 	return mutationsCh, nil
 }
 
+func (s *StreamManager) VerifyViewDocs(docs []Mutation, shouldExist bool) bool {
+	bucket := s.endPoint.Bucket()
+
+	for _, doc := range docs {
+		viewParams := map[string]interface{}{
+			"stale": false,
+			"key":   doc.Key,
+		}
+
+		res, err := bucket.View("integrity", "values", viewParams)
+		if err != nil {
+			fmt.Println("Error querying View:  %v", err)
+			return false
+		}
+		row := res.Rows[0]
+		fmt.Println(row)
+		//viewSum := row.Value.(float64)
+		//expectedSum := float64(sum)
+	}
+
+	return true
+}
+
+func (s *StreamManager) VerifyKVDocs(docs []Mutation, shouldExist bool) bool {
+	bucket := s.endPoint.Bucket()
+	rdoc := make(map[string]interface{})
+
+	// get doc from mcd engine
+	for _, doc := range docs {
+		if err := bucket.Get(doc.Key, &rdoc); err != nil {
+			// doc exists
+			if shouldExist == false {
+				// but doc should not exist
+				fmt.Println("ERROR [kv]: expected rollback doc to be deleted", doc.Key)
+				return false
+			}
+		} else {
+			// doc is missing
+			if shouldExist == true {
+				// but doc should exist
+				fmt.Println("ERROR [kv]: expected doc to exist after rollback", doc.Key)
+				return false
+			}
+		}
+	}
+
+	return true
+}
+func (s *StreamManager) VerifyQueryDocs(docs []Mutation, shouldExist bool) bool {
+
+	uri := fmt.Sprintf("%s/query/service", s.endPoint.QueryHost)
+	for _, doc := range docs {
+
+		// select key
+		sel := fmt.Sprintf("select * from  `default` where id=='%s'", doc.Key)
+		params := url.Values{"statement": {sel}}
+		res, err := http.PostForm(uri, params)
+		if err != nil || res.StatusCode != 200 {
+			fmt.Println("failed to query index", err)
+			logerr(err)
+		}
+
+		// read response
+		body, err := ioutil.ReadAll(res.Body)
+		logerr(err)
+		var v map[string]interface{}
+		err = json.Unmarshal(body, &v)
+		logerr(err)
+
+		// expect resultCount = 0
+		metrics := v["metrics"].(map[string]interface{})
+		nDocs := metrics["resultCount"].(float64)
+		fmt.Println("Query resultCount shouldExist?", nDocs, shouldExist)
+		if shouldExist && nDocs == 0 {
+			fmt.Printf("ERROR [2i]: expected key (%s | %d) to exist after rollback \n", doc.Key, doc.SeqNo)
+			return false
+		}
+		if shouldExist == false && nDocs > 0 {
+			fmt.Printf("ERROR [2i]: expected key (%s | %d) to be removed after rollback\n", doc.Key, doc.SeqNo)
+			return false
+		}
+	}
+
+	return true
+}
+
 func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, startSequence, endSequence uint64) int {
 
 	vb := mutations.VBucket
@@ -201,22 +316,56 @@ func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, sta
 
 	// get all keys higher than takeover seqno which should be rolled back
 	rollbackDocs := []Mutation{}
+	persistedDocs := []Mutation{}
 	for _, m := range mutations.Docs {
 		fmt.Println(m.SeqNo, m.Key)
 		if m.SeqNo > takeoverSequence {
 			rollbackDocs = append(rollbackDocs, m)
-			fmt.Println("Rollback: ", m.Key)
+		} else {
+			persistedDocs = append(persistedDocs, m)
 		}
 	}
 
-	return ROLLBACK_OK
-	// all of these keys should be missing
-	// verify kv
-	// verify views
-	// verify index
-	// keys prior to takeover seqno should be present
+	if len(rollbackDocs) == 0 {
+		fmt.Println("dcp rollback did not occur after takeover")
+		return ERR_NO_ROLLBACK
+	}
 
-	// get new high seqNo
-	// uuid := GetVBucketStat(endPoint, mutations.VBucket, "uuid")
-	// panic("VERIFY TAKEVOER! " + uuid + " : " + takeoverSequenceStat)
+	return s.VerifyEngines(rollbackDocs, persistedDocs)
+
+}
+
+func (s *StreamManager) VerifyEngines(rollbackDocs, persistedDocs []Mutation) int {
+
+	// view expect rollback docs to be missing
+	if ok := s.VerifyViewDocs(rollbackDocs, false); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+
+	// view expect persisted docs to be present
+	if ok := s.VerifyViewDocs(persistedDocs, true); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+
+	// 2i expect rollback docs to be missing
+	if ok := s.VerifyQueryDocs(rollbackDocs, false); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+
+	// 2i expect persisted docs to be present
+	if ok := s.VerifyQueryDocs(persistedDocs, true); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+
+	// kv expect rollback docs to be missing
+	if ok := s.VerifyKVDocs(rollbackDocs, false); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+
+	// kv expect persisted docs to be present
+	if ok := s.VerifyKVDocs(persistedDocs, true); ok == false {
+		return ERR_ROLLBACK_FAIL
+	}
+
+	return ROLLBACK_OK
 }
