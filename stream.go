@@ -94,10 +94,22 @@ func (s *StreamManager) VerifyVBucket(vb uint16) int {
 	lastStreamMutations = <-streamCh
 
 	// detect if uuid changed (ie.. vbucket takeover)
-	newUuid := stats.UUID(vb)
-	if newUuid == uuid {
+	didVBTakover := false
+	for i := 0; i < 5; i++ {
+		didVBTakover = (stats.UUID(vb) != uuid)
+
+		if didVBTakover {
+			break // takeover detected
+		}
+
+		// retry wait
+		time.Sleep(time.Second * 5)
+		fmt.Println("Expected change in uuid... retry", uuid)
+	}
+
+	if !didVBTakover {
 		// did not verify a takeover phase
-		fmt.Println("stream ended without a takeover occurring")
+		fmt.Println("Stream ended without a takeover occurring...exiting")
 		return ERR_NO_VB_TAKEOVER
 	}
 
