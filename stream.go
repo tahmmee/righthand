@@ -233,7 +233,7 @@ func (s *StreamManager) VerifyViewDocs(docs []Mutation, shouldExist bool) bool {
 			return false
 		}
 		if shouldExist == false && nRows > 0 {
-			fmt.Println("ERROR [kv]: expected rollback doc to be deleted", doc.Key)
+			fmt.Println("ERROR [view]: expected rollback doc to be deleted", doc.Key)
 			return false
 		}
 		fmt.Printf("ok [view] %s exists: %t, expected: %t\n", doc.Key, nRows > 0, shouldExist)
