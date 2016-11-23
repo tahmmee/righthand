@@ -222,7 +222,7 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 func (s *StreamManager) VerifyViewDocs(docs []Mutation, shouldExist bool) bool {
 	bucket := s.endPoint.Bucket()
 	for _, doc := range docs {
-		res, ok := s.doViewQuery(bucket, doc.Key, 30, 5)
+		res, ok := s.doViewQuery(bucket, doc.Key, 600, 10)
 		if ok == false {
 			return false
 		}
@@ -274,10 +274,10 @@ func (s *StreamManager) doViewQuery(bucket *couchbase.Bucket, key string, timeou
 				}
 			}
 		}
-	case <-time.After(time.Second * time.Duration(timeout)):
+	case <-time.After(time.Second * time.Duration(timeout*2)):
 		if retries > 0 {
 			fmt.Println("view engine not responding... retry", retries)
-			return s.doViewQuery(bucket, key, timeout, retries-1)
+			return s.doViewQuery(bucket, key, timeout, retries)
 		}
 	}
 
