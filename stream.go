@@ -222,7 +222,7 @@ func (s *StreamManager) StreamMutations(feed *couchbase.UprFeed, vb uint16, vbuu
 func (s *StreamManager) VerifyViewDocs(docs []Mutation, shouldExist bool) bool {
 	bucket := s.endPoint.Bucket()
 	for _, doc := range docs {
-		res, ok := s.doViewQuery(bucket, doc.Key, 600, 10)
+		res, ok := s.doViewQuery(bucket, doc.Key, 60, 20)
 		if ok == false {
 			return false
 		}
@@ -357,16 +357,24 @@ func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, sta
 	// get takeover seqno from new failover log
 	takeoverSequenceStat := stats.FailoverSequence(vb, "0")
 	takeoverSequence, _ := strconv.ParseUint(takeoverSequenceStat, 10, 64)
-	fmt.Println("Verify takover occurred at sequence: ", takeoverSequence)
+	highSequenceStat := stats.HighSequence(vb)
+	highSequence, _ := strconv.ParseUint(highSequenceStat, 10, 64)
+
+	if highSequence < takeoverSequence {
+		fmt.Printf("ERROR: High Sequence: %d, cannot be less than Takeover Sequence: %d\n",
+			highSequence, takeoverSequence)
+		return ERR_NO_ROLLBACK
+	}
 
 	// get all keys higher than takeover seqno which should be rolled back
 	rollbackDocs := []Mutation{}
 	persistedDocs := []Mutation{}
 	for _, m := range mutations.Docs {
-		fmt.Println(m.SeqNo, m.Key)
-		if m.SeqNo > takeoverSequence {
+		if m.SeqNo > highSequence {
+			fmt.Println("rollback", m.SeqNo, m.Key)
 			rollbackDocs = append(rollbackDocs, m)
 		} else {
+			fmt.Println("persisted", m.SeqNo, m.Key)
 			persistedDocs = append(persistedDocs, m)
 		}
 	}
@@ -376,6 +384,8 @@ func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, sta
 		return ERR_NO_ROLLBACK
 	}
 
+	fmt.Printf("VERIFY: Rollback to takeover sequence: %d   or High Seq: %d",
+		takeoverSequence, highSequence)
 	return s.VerifyEngines(rollbackDocs, persistedDocs)
 
 }
