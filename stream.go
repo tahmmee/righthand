@@ -267,8 +267,8 @@ func (s *StreamManager) doViewQuery(bucket *couchbase.Bucket, key string, timeou
 			// if we got a timeout then retry
 			if err.Reason == "timeout" {
 				if retries > 0 {
-					fmt.Println("view query timeout... retry", retries)
-					return s.doViewQuery(bucket, key, timeout, retries-1)
+					fmt.Println("view query timeout... retry", retries, err)
+					res, _ = s.doViewQuery(bucket, key, timeout, retries-1)
 				} else {
 					return res, false
 				}
@@ -277,7 +277,7 @@ func (s *StreamManager) doViewQuery(bucket *couchbase.Bucket, key string, timeou
 	case <-time.After(time.Second * time.Duration(timeout*2)):
 		if retries > 0 {
 			fmt.Println("view engine not responding... retry", retries)
-			return s.doViewQuery(bucket, key, timeout, retries)
+			res, _ = s.doViewQuery(bucket, key, timeout, retries)
 		}
 	}
 
@@ -384,7 +384,7 @@ func (s *StreamManager) VerifyLastStreamMutations(mutations StreamMutations, sta
 		return ERR_NO_ROLLBACK
 	}
 
-	fmt.Printf("VERIFY: Rollback to takeover sequence: %d   or High Seq: %d",
+	fmt.Printf("VERIFY: Rollback to takeover sequence: %d   or High Seq: %d\n",
 		takeoverSequence, highSequence)
 	return s.VerifyEngines(rollbackDocs, persistedDocs)
 
